@@ -1,22 +1,22 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use clap::{ArgAction, Parser};
 use hydro_deploy::gcp::GcpNetwork;
-use hydro_deploy::{AwsNetwork, Deployment, Host};
+use hydro_deploy::aws::NetworkResources;
+use hydro_deploy::{AwsNetwork, Deployment, Host, HostTargetType, LinuxCompileType};
 use hydro_lang::deploy::TrybuildHost;
 use hydro_lang::live_collections::stream::{ExactlyOnce, TotalOrder};
 use hydro_lang::location::Location;
 use hydro_lang::nondet::nondet;
 use hydro_lang::viz::config::GraphConfig;
-use hydro_test::kafka::{dest_kafka, kafka_consumer, kafka_producer, setup_topic};
+use hydro_test::kafka::{dest_kafka, kafka_consumer, kafka_producer};
 use stageleft::q;
 
 type HostCreator = Box<dyn Fn(&mut Deployment) -> Arc<dyn Host>>;
 
-const TOPIC: &str = "financial_transactions";
+const TOPIC_PREFIX: &str = "financial_transactions";
 const NUM_PARTITIONS: i32 = 10;
-const NUM_TRANSACTIONS: usize = 1_000_000;
+const NUM_TRANSACTIONS: usize = 100_000;
 const NUM_CONSUMERS: usize = 3;
 
 // cargo run -p hydro_test --example kafka --features kafka -- --brokers 'localhost:9092'
@@ -39,8 +39,12 @@ struct Args {
     aws: bool,
 
     /// Kafka bootstrap servers
-    #[arg(long, default_value = "localhost:9092")]
+    #[arg(long, default_value = "b-2.hydrotestinfrastructur.t43f0t.c8.kafka.us-west-2.amazonaws.com:9094,b-1.hydrotestinfrastructur.t43f0t.c8.kafka.us-west-2.amazonaws.com:9094")]
     brokers: String,
+
+    /// Kafka security protocol (plaintext or SSL for MSK)
+    #[arg(long, default_value = "SSL")]
+    security_protocol: String,
 }
 
 enum Leader {}
@@ -66,16 +70,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .add()
         })
     } else if args.aws {
-        let region = "us-east-1";
-        let network = AwsNetwork::new(region, None);
+        let region = "us-west-2";
+        let network = AwsNetwork::new(
+            region,
+              Some(NetworkResources::new(
+                  "vpc-0c5ff637759408d29".to_owned(),
+                  "subnet-003906531a035a244".to_owned(),
+                  "sg-09db2fe69913f6a76".to_owned(),
+              )),
+        );
 
         Box::new(move |deployment| -> Arc<dyn Host> {
             deployment
                 .AwsEc2Host()
                 .region(region)
-                .instance_type("t3.micro")
-                .ami("ami-0e95a5e2743ec9ec9") // Amazon Linux 2
+                .instance_type("m7i.large")
+                .ami("ami-055a9df0c8c9f681c") // Amazon Linux 2 (us-west-2)
                 .network(network.clone())
+                .target_type(HostTargetType::Linux(LinuxCompileType::Glibc))
                 .add()
         })
     } else {
@@ -83,18 +95,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Box::new(move |_| -> Arc<dyn Host> { localhost.clone() })
     };
 
-    // [Leader] Setup topic and produce transactions
-    setup_topic(&args.brokers, TOPIC, NUM_PARTITIONS).await;
-    println!("Topic '{}' created with {} partitions", TOPIC, NUM_PARTITIONS);
+    // Use a unique topic name per run to avoid stale messages from previous runs.
+    let topic = format!("{}_{}", TOPIC_PREFIX, std::process::id());
 
     let mut flow = hydro_lang::compile::builder::FlowBuilder::new();
     let leader = flow.process::<Leader>();
     let consumers = flow.cluster::<Consumer>();
 
-    // Leader: produce 1M transactions spread across 10 partitions.
+    // Leader: produce transactions spread across partitions.
     // Each transaction is (account_id, amount) serialized as key=account, value=amount.
     {
-        let producer = kafka_producer(&leader, &args.brokers);
+        let producer = kafka_producer(
+            &leader,
+            &args.brokers,
+            &args.security_protocol,
+            &topic,
+            NUM_PARTITIONS,
+        );
         let transactions = leader.source_iter(q!({
             (0..NUM_TRANSACTIONS).map(|i| {
                 let account = format!("account_{}", i % 100);
@@ -102,12 +119,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 (account, amount)
             })
         }));
-        dest_kafka(producer, transactions, TOPIC);
+        dest_kafka(producer, transactions, &topic);
+        // Sentinel so the runner knows when producing is done.
+        leader
+            .source_iter(q!(std::iter::once("PRODUCE_DONE".to_string())))
+            .for_each(q!(|msg| println!("{}", msg)));
     }
 
     // Consumers: read from topic and compute per-account balances.
     {
-        let messages = kafka_consumer(&consumers, &args.brokers, "kafka_example_consumers", TOPIC)
+        let messages = kafka_consumer(&consumers, &args.brokers, "kafka_example_consumers", &topic, &args.security_protocol)
             .assume_ordering::<TotalOrder>(
                 nondet!(/** Safe: side effect is only printing final balances. */),
             )
@@ -122,39 +143,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let amount: i64 = value.parse().ok()?;
                 Some((key, amount))
             }))
-            .fold(
-                q!(|| HashMap::<String, i64>::new()),
-                q!(|balances, (account, amount)| {
-                    *balances.entry(account).or_insert(0) += amount;
-                }),
-            );
-
-        messages.into_stream().for_each(q!(|balances: HashMap<String, i64>| {
-            println!("Final balances ({} accounts):", balances.len());
-            let mut sorted: Vec<_> = balances.into_iter().collect();
-            sorted.sort_by(|a, b| a.0.cmp(&b.0));
-            for (account, balance) in sorted.iter().take(10) {
-                println!("  {}: {}", account, balance);
-            }
-            if sorted.len() > 10 {
-                println!("  ... and {} more accounts", sorted.len() - 10);
-            }
-        }));
+            .for_each(q!(|(account, amount)| {
+                println!("{}: {}", account, amount);
+            }));
     }
 
     // Extract the IR BEFORE the builder is consumed by deployment methods
     let built = flow.finalize();
 
     // Generate graph visualizations based on command line arguments
-    built.generate_graph_with_config(&args.graph, None)?;
-
-    // If we're just generating a graph file, exit early
-    if args.graph.should_exit_after_graph_generation() {
+    if built.generate_graph(&args.graph)?.is_some() {
         return Ok(());
     }
 
     // Now use the built flow for deployment with optimization
-    let _nodes = built
+    let nodes = built
         .with_default_optimize()
         .with_process(
             &leader,
@@ -173,9 +176,70 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     deployment.deploy().await.unwrap();
     deployment.start().await.unwrap();
 
-    println!("Running Kafka financial transactions example...");
-    println!("Press Ctrl+C to stop.");
+    // Subscribe to stdout from all deployed nodes and count messages.
+    let start = std::time::Instant::now();
+    let total = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (done_tx, mut done_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let (produce_done_tx, produce_done_rx) = tokio::sync::oneshot::channel::<()>();
+    {
+        use hydro_lang::deploy::DeployCrateWrapper;
 
-    tokio::signal::ctrl_c().await.unwrap();
+        let leader_node = nodes.get_process(&leader);
+        let mut leader_out = leader_node.stdout();
+        let produce_done_tx = std::sync::Mutex::new(Some(produce_done_tx));
+        tokio::spawn(async move {
+            while let Some(line) = leader_out.recv().await {
+                if line.trim() == "PRODUCE_DONE" {
+                    if let Some(tx) = produce_done_tx.lock().unwrap().take() {
+                        let _ = tx.send(());
+                    }
+                } else {
+                    println!("[Leader] {line}");
+                }
+            }
+        });
+
+        for (i, member) in nodes.get_cluster(&consumers).members().into_iter().enumerate() {
+            let mut member_out = member.stdout();
+            let total = total.clone();
+            let done_tx = done_tx.clone();
+            tokio::spawn(async move {
+                while let Some(_line) = member_out.recv().await {
+                    let t = total.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    if t % 10_000 == 0 {
+                        println!("[Consumer {i}] ... {t} total messages consumed so far");
+                    }
+                    if t >= NUM_TRANSACTIONS {
+                        let _ = done_tx.send(()).await;
+                        return;
+                    }
+                }
+            });
+        }
+    }
+    drop(done_tx);
+
+    println!("Running Kafka financial transactions example ({NUM_TRANSACTIONS} messages)...");
+
+    let _ = produce_done_rx.await;
+    let produce_elapsed = start.elapsed();
+    println!(
+        "Produce: {NUM_TRANSACTIONS} messages in {:.2?} ({:.0} msgs/sec)",
+        produce_elapsed,
+        NUM_TRANSACTIONS as f64 / produce_elapsed.as_secs_f64()
+    );
+
+    done_rx.recv().await;
+    let total_elapsed = start.elapsed();
+    let consume_elapsed = total_elapsed - produce_elapsed;
+    println!(
+        "Consume: {NUM_TRANSACTIONS} messages in {:.2?} ({:.0} msgs/sec)",
+        consume_elapsed,
+        NUM_TRANSACTIONS as f64 / consume_elapsed.as_secs_f64()
+    );
+    println!(
+        "Total:   {:.2?}",
+        total_elapsed,
+    );
     Ok(())
 }

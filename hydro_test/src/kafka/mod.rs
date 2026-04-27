@@ -33,16 +33,25 @@ fn init_rewrites() {
 }
 
 /// Creates a Kafka `FutureProducer` singleton.
+///
+/// The topic will be created on the broker before the producer is returned.
+/// This runs on the deployed host, so it works even when brokers are in a
+/// private network unreachable from the local machine.
 pub fn kafka_producer<'a, Loc>(
     location: &Loc,
     brokers: &'a str,
+    security_protocol: &'a str,
+    topic: &'a str,
+    num_partitions: i32,
 ) -> Singleton<FutureProducer, Loc, Bounded>
 where
     Loc: Location<'a> + NoTick + NoAtomic,
 {
     location.singleton(q!({
+        self::setup_topic_blocking(brokers, topic, num_partitions, security_protocol);
         rdkafka::config::ClientConfig::new()
             .set("bootstrap.servers", brokers)
+            .set("security.protocol", security_protocol)
             .create::<rdkafka::producer::FutureProducer>()
             .expect("Failed to create Kafka producer")
     }))
@@ -54,6 +63,7 @@ pub fn kafka_consumer<'a, Loc>(
     brokers: &'a str,
     group_id: &'a str,
     topic: &'a str,
+    security_protocol: &'a str,
 ) -> Stream<OwnedMessage, Loc, Bounded, NoOrder, AtLeastOnce>
 where
     Loc: Location<'a> + NoTick + NoAtomic,
@@ -65,6 +75,7 @@ where
                     .set("bootstrap.servers", brokers)
                     .set("group.id", group_id)
                     .set("auto.offset.reset", "earliest")
+                    .set("security.protocol", security_protocol)
                     .create()
                     .expect("Failed to create Kafka consumer");
             rdkafka::consumer::Consumer::subscribe(&consumer, &[topic])
@@ -127,26 +138,35 @@ fn kafka_send(
     }
 }
 
-/// Admin helper: delete topic if it exists, then create it with the given number of partitions.
-pub async fn setup_topic(brokers: &str, topic: &str, num_partitions: i32) {
+/// Admin helper: create a topic with the given number of partitions.
+pub async fn setup_topic(brokers: &str, topic: &str, num_partitions: i32, security_protocol: &str) {
     use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
     use rdkafka::config::ClientConfig;
 
     let admin: AdminClient<rdkafka::client::DefaultClientContext> = ClientConfig::new()
         .set("bootstrap.servers", brokers)
+        .set("security.protocol", security_protocol)
         .create()
         .expect("Failed to create Kafka admin client");
 
-    let opts = AdminOptions::new();
-
-    // Delete topic if it exists (ignore errors if it doesn't exist)
-    let _ = admin.delete_topics(&[topic], &opts).await;
-    // Brief pause to let deletion propagate
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-
-    let new_topic = NewTopic::new(topic, num_partitions, TopicReplication::Fixed(1));
+    let new_topic = NewTopic::new(topic, num_partitions, TopicReplication::Fixed(2));
     admin
-        .create_topics(&[new_topic], &opts)
+        .create_topics(&[new_topic], &AdminOptions::new())
         .await
         .expect("Failed to create Kafka topic");
+}
+
+/// Blocking version of [`setup_topic`] for use inside synchronous `q!()` blocks.
+/// Uses the existing tokio runtime handle from the Hydro process.
+pub fn setup_topic_blocking(brokers: &str, topic: &str, num_partitions: i32, security_protocol: &str) {
+    let handle = tokio::runtime::Handle::current();
+    let brokers = brokers.to_owned();
+    let topic = topic.to_owned();
+    let security_protocol = security_protocol.to_owned();
+    // Spawn a separate thread to avoid calling block_on from within an async context.
+    std::thread::spawn(move || {
+        handle.block_on(setup_topic(&brokers, &topic, num_partitions, &security_protocol));
+    })
+    .join()
+    .expect("Topic setup thread panicked");
 }
