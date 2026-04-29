@@ -16,7 +16,7 @@ type HostCreator = Box<dyn Fn(&mut Deployment) -> Arc<dyn Host>>;
 
 const TOPIC_PREFIX: &str = "financial_transactions";
 const NUM_PARTITIONS: i32 = 10;
-const NUM_TRANSACTIONS: usize = 100_000;
+const NUM_TRANSACTIONS: usize = 10_000;
 const NUM_CONSUMERS: usize = 3;
 
 // cargo run -p hydro_test --example kafka --features kafka -- --brokers 'localhost:9092'
@@ -45,6 +45,14 @@ struct Args {
     /// Kafka security protocol (plaintext or SSL for MSK)
     #[arg(long, default_value = "SSL")]
     security_protocol: String,
+
+    /// Run mode: "produce" (produce only, prints topic name), "consume" (consume only, requires --topic), or "both" (default)
+    #[arg(long, default_value = "both")]
+    mode: String,
+
+    /// Topic name for consume-only mode (use the topic printed by a produce run)
+    #[arg(long)]
+    topic: Option<String>,
 }
 
 enum Leader {}
@@ -95,16 +103,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Box::new(move |_| -> Arc<dyn Host> { localhost.clone() })
     };
 
-    // Use a unique topic name per run to avoid stale messages from previous runs.
-    let topic = format!("{}_{}", TOPIC_PREFIX, std::process::id());
+    let produce = args.mode == "produce" || args.mode == "both";
+    let consume = args.mode == "consume" || args.mode == "both";
+
+    // For consume-only, require --topic; otherwise generate a unique one.
+    let topic = if let Some(t) = &args.topic {
+        t.clone()
+    } else {
+        format!("{}_{}", TOPIC_PREFIX, std::process::id())
+    };
 
     let mut flow = hydro_lang::compile::builder::FlowBuilder::new();
     let leader = flow.process::<Leader>();
     let consumers = flow.cluster::<Consumer>();
 
     // Leader: produce transactions spread across partitions.
-    // Each transaction is (account_id, amount) serialized as key=account, value=amount.
-    {
+    if produce {
         let producer = kafka_producer(
             &leader,
             &args.brokers,
@@ -119,21 +133,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 (account, amount)
             })
         }));
-        dest_kafka(producer, transactions, &topic);
-        // Sentinel so the runner knows when producing is done.
-        leader
-            .source_iter(q!(std::iter::once("PRODUCE_DONE".to_string())))
-            .for_each(q!(|msg| println!("{}", msg)));
+        let sent = dest_kafka(producer, transactions, &topic);
+        sent.for_each(q!({
+                let count = std::cell::Cell::new(0usize);
+                move |producer| {
+                    let c = count.get() + 1;
+                    count.set(c);
+                    if c >= NUM_TRANSACTIONS {
+                        rdkafka::producer::Producer::flush(&*producer, std::time::Duration::from_secs(30))
+                            .expect("Failed to flush producer");
+                        println!("PRODUCE_DONE {}", c);
+                    }
+                }
+            }));
     }
 
-    // Consumers: read from topic and compute per-account balances.
-    {
-        let messages = kafka_consumer(&consumers, &args.brokers, "kafka_example_consumers", &topic, &args.security_protocol)
+    // Consumers: read from topic and print each message.
+    if consume {
+        let _messages = kafka_consumer(&consumers, &args.brokers, "kafka_example_consumers", &topic, &args.security_protocol)
             .assume_ordering::<TotalOrder>(
-                nondet!(/** Safe: side effect is only printing final balances. */),
+                nondet!(/** Safe: side effect is only printing. */),
             )
             .assume_retries::<ExactlyOnce>(
-                nondet!(/** Safe: side effect is only printing final balances. */),
+                nondet!(/** Safe: side effect is only printing. */),
             )
             .filter_map(q!(|msg| {
                 let key = rdkafka::Message::key(&msg)
@@ -156,27 +178,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // Now use the built flow for deployment with optimization
-    let nodes = built
-        .with_default_optimize()
-        .with_process(
-            &leader,
+    // Deploy
+    let mut hosts_builder = built.with_default_optimize();
+    hosts_builder = hosts_builder.with_process(
+        &leader,
+        TrybuildHost::new(create_host(&mut deployment))
+            .features(vec!["kafka".to_owned()]),
+    );
+    hosts_builder = hosts_builder.with_cluster(
+        &consumers,
+        (0..NUM_CONSUMERS).map(|_| {
             TrybuildHost::new(create_host(&mut deployment))
-                .features(vec!["kafka".to_owned()]),
-        )
-        .with_cluster(
-            &consumers,
-            (0..NUM_CONSUMERS).map(|_| {
-                TrybuildHost::new(create_host(&mut deployment))
-                    .features(vec!["kafka".to_owned()])
-            }),
-        )
-        .deploy(&mut deployment);
+                .features(vec!["kafka".to_owned()])
+        }),
+    );
+    let nodes = hosts_builder.deploy(&mut deployment);
 
     deployment.deploy().await.unwrap();
     deployment.start().await.unwrap();
 
-    // Subscribe to stdout from all deployed nodes and count messages.
+    println!("Running Kafka example (mode={}, topic={topic}, {NUM_TRANSACTIONS} messages)...", args.mode);
+
     let start = std::time::Instant::now();
     let total = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let (done_tx, mut done_rx) = tokio::sync::mpsc::channel::<()>(1);
@@ -184,62 +206,69 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         use hydro_lang::deploy::DeployCrateWrapper;
 
-        let leader_node = nodes.get_process(&leader);
-        let mut leader_out = leader_node.stdout();
-        let produce_done_tx = std::sync::Mutex::new(Some(produce_done_tx));
-        tokio::spawn(async move {
-            while let Some(line) = leader_out.recv().await {
-                if line.trim() == "PRODUCE_DONE" {
-                    if let Some(tx) = produce_done_tx.lock().unwrap().take() {
-                        let _ = tx.send(());
-                    }
-                } else {
-                    println!("[Leader] {line}");
-                }
-            }
-        });
-
-        for (i, member) in nodes.get_cluster(&consumers).members().into_iter().enumerate() {
-            let mut member_out = member.stdout();
-            let total = total.clone();
-            let done_tx = done_tx.clone();
+        if produce {
+            let leader_node = nodes.get_process(&leader);
+            let mut leader_out = leader_node.stdout();
+            let produce_done_tx = std::sync::Mutex::new(Some(produce_done_tx));
             tokio::spawn(async move {
-                while let Some(_line) = member_out.recv().await {
-                    let t = total.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                    if t % 10_000 == 0 {
-                        println!("[Consumer {i}] ... {t} total messages consumed so far");
-                    }
-                    if t >= NUM_TRANSACTIONS {
-                        let _ = done_tx.send(()).await;
-                        return;
+                while let Some(line) = leader_out.recv().await {
+                    if line.starts_with("PRODUCE_DONE") {
+                        if let Some(tx) = produce_done_tx.lock().unwrap().take() {
+                            let _ = tx.send(());
+                        }
+                    } else {
+                        println!("[Leader] {line}");
                     }
                 }
             });
         }
+
+        if consume {
+            for (i, member) in nodes.get_cluster(&consumers).members().into_iter().enumerate() {
+                let mut member_out = member.stdout();
+                let total = total.clone();
+                let done_tx = done_tx.clone();
+                tokio::spawn(async move {
+                    while let Some(_line) = member_out.recv().await {
+                        let t = total.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        if t % 1_000 == 0 {
+                            println!("[Consumer {i}] ... {t} total messages consumed so far");
+                        }
+                        if t >= NUM_TRANSACTIONS {
+                            let _ = done_tx.send(()).await;
+                            return;
+                        }
+                    }
+                });
+            }
+        }
     }
     drop(done_tx);
 
-    println!("Running Kafka financial transactions example ({NUM_TRANSACTIONS} messages)...");
+    if produce {
+        let _ = produce_done_rx.await;
+        let produce_elapsed = start.elapsed();
+        println!(
+            "Produce: {NUM_TRANSACTIONS} messages in {:.2?} ({:.0} msgs/sec)",
+            produce_elapsed,
+            NUM_TRANSACTIONS as f64 / produce_elapsed.as_secs_f64()
+        );
+        if !consume {
+            println!("Topic: {topic}");
+            println!("Run consume with: --mode consume --topic {topic}");
+            return Ok(());
+        }
+    }
 
-    let _ = produce_done_rx.await;
-    let produce_elapsed = start.elapsed();
-    println!(
-        "Produce: {NUM_TRANSACTIONS} messages in {:.2?} ({:.0} msgs/sec)",
-        produce_elapsed,
-        NUM_TRANSACTIONS as f64 / produce_elapsed.as_secs_f64()
-    );
+    if consume {
+        done_rx.recv().await;
+        let elapsed = start.elapsed();
+        println!(
+            "Consume: {NUM_TRANSACTIONS} messages in {:.2?} ({:.0} msgs/sec)",
+            elapsed,
+            NUM_TRANSACTIONS as f64 / elapsed.as_secs_f64()
+        );
+    }
 
-    done_rx.recv().await;
-    let total_elapsed = start.elapsed();
-    let consume_elapsed = total_elapsed - produce_elapsed;
-    println!(
-        "Consume: {NUM_TRANSACTIONS} messages in {:.2?} ({:.0} msgs/sec)",
-        consume_elapsed,
-        NUM_TRANSACTIONS as f64 / consume_elapsed.as_secs_f64()
-    );
-    println!(
-        "Total:   {:.2?}",
-        total_elapsed,
-    );
     Ok(())
 }

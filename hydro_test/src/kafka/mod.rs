@@ -1,17 +1,17 @@
-use std::future::Future;
-
 use hydro_lang::live_collections::boundedness::Boundedness;
 use hydro_lang::live_collections::stream::{AtLeastOnce, ExactlyOnce, NoOrder, Ordering};
 use hydro_lang::location::tick::{NoAtomic, NoTick};
 use hydro_lang::location::Location;
 use hydro_lang::prelude::*;
 use rdkafka::message::OwnedMessage;
-use rdkafka::producer::FutureProducer;
+use rdkafka::producer::BaseProducer;
+
+type SharedProducer = std::sync::Arc<BaseProducer>;
 
 #[ctor::ctor]
 fn init_rewrites() {
     stageleft::add_private_reexport(
-        vec!["rdkafka", "producer", "future_producer"],
+        vec!["rdkafka", "producer", "base_producer"],
         vec!["rdkafka", "producer"],
     );
     stageleft::add_private_reexport(
@@ -32,7 +32,7 @@ fn init_rewrites() {
     );
 }
 
-/// Creates a Kafka `FutureProducer` singleton.
+/// Creates a Kafka `BaseProducer` singleton wrapped in `Arc` for sharing.
 ///
 /// The topic will be created on the broker before the producer is returned.
 /// This runs on the deployed host, so it works even when brokers are in a
@@ -43,17 +43,19 @@ pub fn kafka_producer<'a, Loc>(
     security_protocol: &'a str,
     topic: &'a str,
     num_partitions: i32,
-) -> Singleton<FutureProducer, Loc, Bounded>
+) -> Singleton<SharedProducer, Loc, Bounded>
 where
     Loc: Location<'a> + NoTick + NoAtomic,
 {
     location.singleton(q!({
         self::setup_topic_blocking(brokers, topic, num_partitions, security_protocol);
-        rdkafka::config::ClientConfig::new()
-            .set("bootstrap.servers", brokers)
-            .set("security.protocol", security_protocol)
-            .create::<rdkafka::producer::FutureProducer>()
-            .expect("Failed to create Kafka producer")
+        std::sync::Arc::new(
+            rdkafka::config::ClientConfig::new()
+                .set("bootstrap.servers", brokers)
+                .set("security.protocol", security_protocol)
+                .create::<rdkafka::producer::BaseProducer>()
+                .expect("Failed to create Kafka producer"),
+        )
     }))
 }
 
@@ -104,38 +106,35 @@ where
         .weaken_ordering()
 }
 
-/// Sends `(key, payload)` pairs to a Kafka topic.
+/// Sends `(key, payload)` pairs to a Kafka topic using `BaseProducer`.
+/// Messages are queued without waiting for acks. `poll(Duration::ZERO)` is
+/// called after each send to drive delivery callbacks.
 pub fn dest_kafka<'a, Loc, Bound: Boundedness, Order: Ordering>(
-    producer: Singleton<FutureProducer, Loc, Bounded>,
+    producer: Singleton<SharedProducer, Loc, Bounded>,
     input: Stream<(String, String), Loc, Bound, Order, ExactlyOnce>,
     topic: &'a str,
-) where
+) -> Stream<SharedProducer, Loc, Bound, Order, ExactlyOnce>
+where
     Loc: Location<'a>,
 {
     input
         .cross_singleton(producer)
-        .map(q!(
-            |((key, payload), producer)| self::kafka_send(producer, topic, key, payload)
-        ))
-        .resolve_futures_blocking();
-}
-
-fn kafka_send(
-    producer: FutureProducer,
-    topic: &str,
-    key: String,
-    payload: String,
-) -> impl Future<Output = ()> {
-    let topic = topic.to_owned();
-    async move {
-        let record = rdkafka::producer::FutureRecord::to(&topic)
-            .key(&key)
-            .payload(&payload);
-        producer
-            .send(record, rdkafka::util::Timeout::Never)
-            .await
-            .expect("Failed to send message to Kafka");
-    }
+        .map(q!(|((key, payload), producer)| {
+            loop {
+                let record = rdkafka::producer::BaseRecord::to(topic)
+                    .key(&key)
+                    .payload(&payload);
+                match producer.send(record) {
+                    Ok(()) => break,
+                    Err((rdkafka::error::KafkaError::MessageProduction(rdkafka::types::RDKafkaErrorCode::QueueFull), _)) => {
+                        producer.poll(std::time::Duration::from_millis(100));
+                    }
+                    Err((e, _)) => panic!("Failed to send message to Kafka: {}", e),
+                }
+            }
+            producer.poll(std::time::Duration::ZERO);
+            producer
+        }))
 }
 
 /// Admin helper: create a topic with the given number of partitions.
