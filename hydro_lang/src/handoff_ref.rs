@@ -126,12 +126,40 @@ fn register_handoff_ref(
     })
 }
 
+/// Resolves a captured `&Arc<T>` (held in a `singleton()` handoff) to `&T`.
+///
+/// The types are spelled out so that field and method accesses on the result type-check even
+/// before the handoff buffer's element type has been inferred.
+fn resolve_arc_singleton<T>(ident: &syn::Ident) -> proc_macro2::TokenStream {
+    let t = stageleft::quote_type::<T>();
+    quote!(<::std::sync::Arc<#t> as ::std::ops::Deref>::deref(#ident))
+}
+
+/// Resolves a captured `&Option<Arc<T>>` (held in an `optional()` handoff) to `Option<&T>`.
+///
+/// The types are spelled out so that field and method accesses on the result type-check even
+/// before the handoff buffer's element type has been inferred.
+fn resolve_arc_optional<T>(ident: &syn::Ident) -> proc_macro2::TokenStream {
+    let t = stageleft::quote_type::<T>();
+    quote!(::std::option::Option::<::std::sync::Arc<#t>>::as_deref(#ident))
+}
+
 /// Macro to define a handoff reference struct with all necessary trait impls.
+///
+/// Each entry may optionally name a resolver function (`fn<T>(&syn::Ident) -> TokenStream`,
+/// instantiated with the referenced element type) that maps the captured handoff ident to the
+/// expression substituted into the closure; by default the ident itself is used.
 macro_rules! define_handoff_ref {
+    (@resolve $ident:ident, $t:ty) => {
+        quote!(#$ident)
+    };
+    (@resolve $ident:ident, $t:ty, $resolve:ident) => {
+        $resolve::<$t>(&$ident)
+    };
     (
         $(
             $(#[$meta:meta])*
-            $name:ident, $is_mut:expr, $kind:expr, $output:ty
+            $name:ident, $is_mut:expr, $kind:expr, $output:ty $(, $resolve:ident)?
         )+
     ) => {
         $(
@@ -174,7 +202,7 @@ macro_rules! define_handoff_ref {
                     (
                         QuoteTokens {
                             prelude: None,
-                            expr: Some(quote!(#ident)),
+                            expr: Some(define_handoff_ref!(@resolve ident, T $(, $resolve)?)),
                         },
                         (),
                     )
@@ -190,7 +218,9 @@ macro_rules! define_handoff_ref {
     OptionalRef,
     OptionalMut,
     StreamRef,
-    StreamMut
+    StreamMut,
+    SlicedSingletonRef,
+    SlicedOptionalRef
 )]
 define_handoff_ref!(
     /// A shared reference handle to a singleton, resolves to `&T` at runtime.
@@ -222,6 +252,23 @@ define_handoff_ref!(
     ///
     /// Created via [`Stream::by_mut()`](crate::live_collections::Stream::by_mut).
     StreamMut, true, HandoffRefKind::Vec, &'a mut Vec<T>
+
+    /// A shared reference handle to a top-level bounded singleton read inside a `sliced!` body,
+    /// resolves to `&T` at runtime.
+    ///
+    /// Created by `use::reference(...)` in [`sliced!`](crate::live_collections::sliced::sliced)
+    /// (see [`reference`](crate::live_collections::sliced::style::reference)). The value is
+    /// held behind an `Arc` across ticks, so it is not cloned on each tick.
+    SlicedSingletonRef, false, HandoffRefKind::Singleton, &'a T, resolve_arc_singleton
+
+    /// A shared reference handle to a top-level bounded optional read inside a `sliced!` body,
+    /// resolves to `Option<&T>` at runtime.
+    ///
+    /// Created by `use::reference(...)` in [`sliced!`](crate::live_collections::sliced::sliced)
+    /// (see [`reference`](crate::live_collections::sliced::style::reference)). The value is
+    /// held behind an `Arc` across ticks, so it is not cloned on each tick. Since `Option<&T>` is
+    /// a value rather than a reference, closures capturing this handle must be `move` closures.
+    SlicedOptionalRef, false, HandoffRefKind::Optional, Option<&'a T>, resolve_arc_optional
 );
 
 #[cfg(test)]

@@ -9,6 +9,21 @@ use crate::location::{Location, Tick};
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __sliced_parse_uses__ {
+    // Parse reference use statements: let name = use::reference(args...);
+    // These are rebound to a reference handle (via `by_ref`) before the body runs, so they are
+    // recorded in the second slot of the use entry.
+    (
+        @uses [$($uses:tt)*]
+        @states [$($states:tt)*]
+        let $name:ident = use::reference($($args:expr),+ $(,)?); $($rest:tt)*
+    ) => {
+        $crate::__sliced_parse_uses__!(
+            @uses [$($uses)* { $name, [$name], $crate::macro_support::copy_span::copy_span!($($args,)* reference)($($args),*), $($args),* }]
+            @states [$($states)*]
+            $($rest)*
+        )
+    };
+
     // Parse immutable use statements with style: let name = use::style(args...);
     (
         @uses [$($uses:tt)*]
@@ -16,7 +31,7 @@ macro_rules! __sliced_parse_uses__ {
         let $name:ident = use:: $invocation:expr; $($rest:tt)*
     ) => {
         $crate::__sliced_parse_uses__!(
-            @uses [$($uses)* { $name, $invocation, $invocation }]
+            @uses [$($uses)* { $name, [], $invocation, $invocation }]
             @states [$($states)*]
             $($rest)*
         )
@@ -32,7 +47,7 @@ macro_rules! __sliced_parse_uses__ {
         let $name:ident = use($($args:expr),* $(,)?); $($rest:tt)*
     ) => {
         $crate::__sliced_parse_uses__!(
-            @uses [$($uses)* { $name, $crate::macro_support::copy_span::copy_span!($($args,)* default)($($args),*), $($args),* }]
+            @uses [$($uses)* { $name, [], $crate::macro_support::copy_span::copy_span!($($args,)* default)($($args),*), $($args),* }]
             @states [$($states)*]
             $($rest)*
         )
@@ -65,7 +80,7 @@ macro_rules! __sliced_parse_uses__ {
 
     // Terminal case: uses with optional states
     (
-        @uses [$({ $use_name:ident, $invocation:expr, $($invocation_spans:expr),* })+]
+        @uses [$({ $use_name:ident, [$($use_ref:ident)?], $invocation:expr, $($invocation_spans:expr),* })+]
         @states [$({ $state_name:ident, $state_style:ident, (($($state_ty:ty)?), ($($state_arg:expr)?)) })*]
         $($body:tt)*
     ) => {
@@ -88,6 +103,12 @@ macro_rules! __sliced_parse_uses__ {
             let (
                 $($use_name,)+
             ) = __sliced;
+
+            // Rebind `use::reference` slices to their reference handles. The shadowed slice
+            // stays alive (it owns the IR node the handle borrows) until the end of this block.
+            $($(
+                let $use_ref = $use_ref.by_ref();
+            )?)+
 
             // Create all cycles and pack handles/values into tuples.
             //
@@ -142,8 +163,10 @@ macro_rules! __sliced_parse_uses__ {
 /// along with a non-determinism explanation. The style specifies how the live collection is sliced:
 /// `use::batch` for stream-like collections (such as [`Stream`](crate::live_collections::Stream)),
 /// `use::snapshot` for singleton-like collections (such as
-/// [`Singleton`](crate::live_collections::Singleton)), and `use::atomic` for atomically-processed
-/// collections. All `use` statements must appear before the body.
+/// [`Singleton`](crate::live_collections::Singleton)), `use::atomic` for atomically-processed
+/// collections, and `use::reference` (which takes no non-determinism explanation) for reading a
+/// bounded singleton-like collection by reference (see [Bounded References](#bounded-references)).
+/// All `use` statements must appear before the body.
 ///
 /// ```rust,ignore
 /// let stream = sliced! {
@@ -160,6 +183,25 @@ macro_rules! __sliced_parse_uses__ {
 /// The style-less form `use(collection, nondet!(...))`, which picks between batching and
 /// snapshotting automatically based on the collection type, is deprecated; use the explicit
 /// `use::batch` or `use::snapshot` styles instead.
+///
+/// # Bounded References
+/// A top-level **bounded** [`Singleton`](crate::live_collections::Singleton) or
+/// [`Optional`](crate::live_collections::Optional) (for example, a configuration value fixed
+/// when the flow is built) can be read in every slice with `use::reference(collection)`, which
+/// takes no non-determinism explanation since the collection has a single immutable value.
+/// The binding is a reference handle that can be captured in `q!()` closures in the body,
+/// resolving to `&T` (or `Option<&T>` for an optional) without cloning the value on each tick.
+/// Unbounded collections are rejected at compile time; use `use::snapshot` for those. See
+/// [`reference`](crate::live_collections::sliced::style::reference) for details.
+///
+/// ```rust,ignore
+/// let stream = sliced! {
+///     let batch = use::batch(stream1, nondet!(/** explanation */));
+///     let config = use::reference(bounded_config);
+///
+///     batch.map(q!(|x| x * config.scale))
+/// };
+/// ```
 ///
 /// # Stateful Computations
 /// The `sliced!` macro also supports stateful computations across iterations using `let mut` bindings
@@ -677,5 +719,148 @@ mod tests {
             input_send.send((1, 3));
             assert_eq!(out_recv.next().await, (1, 6));
         });
+    }
+
+    /// A configuration value that is deliberately not `Clone`.
+    pub struct NonCloneConfig {
+        pub offset: i32,
+    }
+
+    /// Test `use::reference` with a bounded singleton whose type is not `Clone`, read by
+    /// reference from several `q!` closures on every tick (not just the first).
+    #[test]
+    fn sim_reference_singleton() {
+        let mut flow = FlowBuilder::new();
+        let node = flow.process::<()>();
+
+        let (input_send, input) = node.sim_input::<i32, _, _>();
+        let config = node.singleton(q!(NonCloneConfig { offset: 100 }));
+
+        let out_recv = sliced! {
+            let batch = use::batch(input, nondet!(/** test */));
+            let config = use::reference(config);
+
+            batch
+                .filter(q!(|x| *x < config.offset))
+                .map(q!(|x| x + config.offset))
+        }
+        .sim_output();
+
+        flow.sim().exhaustive(async || {
+            input_send.send(1);
+            assert_eq!(out_recv.next().await, 101);
+
+            input_send.send(200);
+            input_send.send(2);
+            assert_eq!(out_recv.next().await, 102);
+
+            input_send.send(3);
+            assert_eq!(out_recv.next().await, 103);
+        });
+    }
+
+    /// Test `use::reference` with bounded optionals, which resolve to `Option<&T>`.
+    #[test]
+    fn sim_reference_optional() {
+        let mut flow = FlowBuilder::new();
+        let node = flow.process::<()>();
+
+        let (input_send, input) = node.sim_input::<i32, _, _>();
+        let present = node.singleton(q!(5)).filter(q!(|x| *x > 0));
+        let absent = node.singleton(q!(5)).filter(q!(|x| *x > 10));
+
+        let out_recv = sliced! {
+            let batch = use::batch(input, nondet!(/** test */));
+            let present = use::reference(present);
+            let absent = use::reference(absent);
+
+            // `Option<&T>` is a value (not a reference), so the closure must `move` it in.
+            batch.map(q!(move |x| (
+                x + present.copied().unwrap_or(-1),
+                absent.copied().unwrap_or(-1)
+            )))
+        }
+        .sim_output();
+
+        flow.sim().exhaustive(async || {
+            input_send.send(1);
+            assert_eq!(out_recv.next().await, (6, -1));
+
+            input_send.send(2);
+            assert_eq!(out_recv.next().await, (7, -1));
+        });
+    }
+
+    /// Test `use::reference` on a cluster, where the other sliced inputs drop consistency.
+    #[test]
+    fn sim_reference_cluster() {
+        let mut flow = FlowBuilder::new();
+        let cluster = flow.cluster::<()>();
+
+        let (input_send, input) = cluster.sim_input::<i32, _, _>();
+        let config = cluster.singleton(q!(NonCloneConfig { offset: 100 }));
+
+        let out_recv = sliced! {
+            let batch = use::batch(input, nondet!(/** test */));
+            let config = use::reference(config);
+            batch.map(q!(|x| x + config.offset))
+        }
+        .sim_cluster_output();
+
+        flow.sim()
+            .with_cluster_size(&cluster, 2)
+            .exhaustive(async || {
+                input_send.send(0, 1);
+                input_send.send(1, 2);
+                assert_eq!(out_recv.next(0).await, 101);
+                assert_eq!(out_recv.next(1).await, 102);
+            });
+    }
+
+    /// `use::reference` introduces no non-deterministic choices: the simulator explores exactly
+    /// as many instances as for the same flow without the reference.
+    #[test]
+    fn sim_reference_no_extra_instances() {
+        let with_reference = {
+            let mut flow = FlowBuilder::new();
+            let node = flow.process::<()>();
+
+            let input = node.source_iter(q!(vec![1, 2, 3, 4]));
+            let offset = node.singleton(q!(100));
+
+            let out_recv = sliced! {
+                let batch = use::batch(input, nondet!(/** test */));
+                let offset = use::reference(offset);
+                batch.map(q!(|x| x + *offset))
+            }
+            .sim_output();
+
+            flow.sim().exhaustive(async || {
+                out_recv.assert_yields_only([101, 102, 103, 104]).await;
+            })
+        };
+
+        let without_reference = {
+            let mut flow = FlowBuilder::new();
+            let node = flow.process::<()>();
+
+            let input = node.source_iter(q!(vec![1, 2, 3, 4]));
+
+            let out_recv = sliced! {
+                let batch = use::batch(input, nondet!(/** test */));
+                batch.map(q!(|x| x + 100))
+            }
+            .sim_output();
+
+            flow.sim().exhaustive(async || {
+                out_recv.assert_yields_only([101, 102, 103, 104]).await;
+            })
+        };
+
+        assert_eq!(with_reference, without_reference);
+        assert_eq!(
+            with_reference,
+            8 // 2^3 ways to split up the 4 elements into non-empty batches
+        );
     }
 }
